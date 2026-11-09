@@ -32,13 +32,22 @@ Each `Post` carries: `post_id`, `title`, `subreddit`, `author`, `score`,
 
 ## Install
 
-Requires Python 3.9+.
+Requires Python 3.9+. **Nothing to install** — standard library only.
 
 ```bash
-pip install -r requirements.txt
+git clone https://github.com/jiyanr-ux/paged-listing-client.git
+cd paged-listing-client
+python api_client.py
 ```
 
-Only dependency: [`curl_cffi`](https://pypi.org/project/curl_cffi/).
+To use it from another project in the same interpreter, install it editable:
+
+```bash
+pip install -e /path/to/paged-listing-client
+```
+
+…or just copy `api_client.py` next to your script. It is one file, no imports
+outside the standard library.
 
 ## Quick start
 
@@ -151,17 +160,24 @@ untouched, never build them yourself.
 **Jargon-free:** one anonymous token request, then plain listing requests.
 Nothing else to set up.
 
-## Why `curl_cffi`, and why those headers
+## Why it works
 
-Three details decide whether this works at all. Drop any one and you get
-`403`, or — more confusingly — **HTTP 200 with an HTML page instead of
-JSON**, which looks like success right up to the point it fails to parse:
+Two headers carry the whole thing, and getting them wrong is why naive
+attempts fail with a bare `403` — or, more confusingly, **HTTP 200 with an
+HTML page instead of JSON**, which looks like success right up to the point it
+fails to parse:
 
 | Detail | Why |
 |---|---|
-| `curl_cffi` with `impersonate="chrome131"` | Presents a real Chrome TLS/JA3 fingerprint. Plain `requests`/`urllib` is refused on many networks. |
-| `Accept: application/json` | Without it the endpoint answers with the HTML web app. |
+| `Accept: application/json` | **The load-bearing one.** Without it the endpoint answers with the HTML web app (status 200, `<body class=theme-beta>`). |
+| A descriptive `User-Agent` | Reddit's API rules ask for one; `curl/8` and similar get refused outright. |
 | `raw_json=1` | Keeps `&`, `<`, `>` literal in titles instead of HTML entities. |
+
+What is **not** needed: TLS/JA3 fingerprint spoofing. A `curl_cffi` variant
+with `impersonate="chrome131"` was what the generator originally produced, and
+it does work — but the same requests succeed with plain `urllib`. The
+fingerprint was a red herring; the `Accept` header was the real cause. This
+client therefore has no third-party dependency at all.
 
 The client raises `RedditApiError` with the status code and content type when
 Reddit answers with HTML, so this failure mode is loud, not silent.
@@ -173,8 +189,9 @@ Both are environment variables; the defaults work out of the box.
 | Variable | Default | Purpose |
 |---|---|---|
 | `REDDIT_CLIENT_ID` | a public installed-app id | Use your own app id (register at <https://www.reddit.com/prefs/apps>). |
-| `REDDIT_USER_AGENT` | `python:paged_listing_client:v1.0 …` | Reddit's API rules ask for a client-identifying User-Agent. |
+| `REDDIT_USER_AGENT` | `windows:paged-listing-client:1.0 …` | Reddit's API rules ask for a client-identifying User-Agent. |
 | `REDDIT_MIN_INTERVAL` | `0.1` | Minimum seconds between two requests (0.1 = Reddit's 10 req/s ceiling). |
+| `REDDIT_TIMEOUT` | `30` | Per-request timeout in seconds. |
 
 ## Tests
 
@@ -189,8 +206,8 @@ python -m unittest discover -s tests -v
 - `RedditApiError` — Reddit returned HTML instead of JSON, a payload that is
   not a listing, or a **403** (endpoint not available anonymously; the message
   names the workaround).
-- `curl_cffi.requests.errors.HTTPError` — any other non-2xx status; check
-  `resp.status_code` (401 = token problem, 429 = rate limit).
+- `urllib.error.HTTPError` — any other non-2xx status (401 = token problem,
+  429 = rate limit). Everything else surfaces as `RedditApiError`.
 - Rate limits: **10 requests per second** is Reddit's ceiling (its documented
   OAuth budget is around 100 requests/minute per client). This client enforces
   a 0.1 s minimum gap on every request, so a plain loop cannot trip the limit;

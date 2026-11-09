@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "paged-listing-client"
-version = "1.0.0"
-description = "Small typed Python client for reading a public listing feed and paging through it with cursor tokens."
+version = "1.1.0"
+description = "Small typed, dependency-free Python client for reading a public listing feed and paging through it with cursor tokens."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
-dependencies = ["curl_cffi>=0.7"]
-keywords = ["api-client", "pagination", "json", "listing", "crawler"]
+dependencies = []
+keywords = ["api-client", "pagination", "json", "listing", "stdlib"]
 
 [tool.setuptools]
 py-modules = ["api_client"]

@@ -2,7 +2,7 @@
 Paged listing client for Reddit's public JSON API
 =================================================
 
-A small, typed, dependency-light client for reading a public listing feed
+A small, typed, dependency-free client for reading a public listing feed
 (the front page, a subreddit, or a user's submissions) and paging through it
 with Reddit's cursor tokens.
 
@@ -13,16 +13,15 @@ What it does
   automatically before it expires.
 * Returns typed ``Post`` objects: title, subreddit, author, score, comment
   count and permalink.
-* Pages with reddit's opaque ``after`` cursor (``iter_pages``) and stops on
-  the cursor running out, not on an empty page.
+* Pages with Reddit's opaque ``after`` cursor (``iter_pages``) and stops when
+  the cursor runs out, not when a page happens to be empty.
 
 Requirements
 ------------
-    pip install -r requirements.txt      # curl_cffi
+None — standard library only.
 
-`curl_cffi` is required, not optional: Reddit refuses stdlib clients
-(`urllib`, plain `requests`) from many networks. See *Why curl_cffi* in
-README.md.
+Read the two headers in ``_make_headers()``; they are the whole trick, and
+README.md -> "Why it works" explains which of them are actually load-bearing.
 
 Quick start
 -----------
@@ -31,7 +30,7 @@ Quick start
     from api_client import get_listing, iter_pages
 
     page = get_listing("popular", limit=25)
-    for post in page.posts:
+    for post in page:
         print(post.subreddit, post.title, post.score)
 
 License: MIT (see LICENSE).
@@ -39,16 +38,17 @@ License: MIT (see LICENSE).
 
 from __future__ import annotations
 
+import base64
+import json
 import os
 import sys
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
-from typing import Iterator, Optional
-
-# curl_cffi is imported as `requests` on purpose: its API mirrors
-# `requests`, with the addition of the `impersonate=` argument.
-import curl_cffi.requests as requests
+from typing import Any, Iterator, Optional
 
 # Windows terminals often default to cp1252, which cannot encode the emoji and
 # non-Latin scripts that show up in real post titles.
@@ -64,22 +64,18 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() not in ("utf-8", "utf-16"
 # ---------------------------------------------------------------------------
 
 # Public "installed app" client id — not a secret, and no redirect URI or user
-# login is attached to it. Override with REDDIT_CLIENT_ID if you registered
-# your own app at https://www.reddit.com/prefs/apps.
+# login is attached to it. Register your own at
+# https://www.reddit.com/prefs/apps and set REDDIT_CLIENT_ID to use it.
 CLIENT_ID: str = os.environ.get("REDDIT_CLIENT_ID", "ohXpoqrZYub1kg")
 
 # Reddit's API rules ask for a User-Agent that identifies the client. Set
 # REDDIT_USER_AGENT to your own before heavy use.
 USER_AGENT: str = os.environ.get(
-    "REDDIT_USER_AGENT", "python:paged_listing_client:v1.0 (by /u/unknown)"
+    "REDDIT_USER_AGENT", "windows:paged-listing-client:1.0 (by /u/unknown)"
 )
 
 TOKEN_URL: str = "https://www.reddit.com/api/v1/access_token"
 OAUTH_BASE: str = "https://oauth.reddit.com"
-
-# TLS/JA3 fingerprint to present. This is what gets the request past Reddit's
-# bot protection; see README.md.
-TLS_IMPERSONATE: str = "chrome131"
 
 # Refresh the token this many seconds before it actually expires.
 TOKEN_SAFETY_MARGIN: int = 60
@@ -95,65 +91,14 @@ MIN_REQUEST_INTERVAL: float = float(os.environ.get("REDDIT_MIN_INTERVAL", "0.1")
 DEFAULT_RETRY_AFTER: float = 5.0
 MAX_RETRY_AFTER: float = 60.0
 
+REQUEST_TIMEOUT: float = float(os.environ.get("REDDIT_TIMEOUT", "30"))
+
 _throttle_lock = threading.Lock()
 _last_request_at: float = 0.0
 
 
-def _throttle() -> None:
-    """Block until at least MIN_REQUEST_INTERVAL has passed since the last call."""
-    global _last_request_at
-    with _throttle_lock:
-        wait = MIN_REQUEST_INTERVAL - (time.monotonic() - _last_request_at)
-        if wait > 0:
-            time.sleep(wait)
-        _last_request_at = time.monotonic()
-
-
-def _forbidden_hint(url: str) -> str:
-    """Explain a 403 in terms of what actually works anonymously."""
-    return (
-        f"Reddit refused this request (403): {url}\n"
-        "With anonymous app-only access the cached listings work — hot, top, "
-        "controversial, and /r/popular — while 'new', 'rising' and /r/all are "
-        "refused. Use one of the working sorts, or register your own app at "
-        "https://www.reddit.com/prefs/apps and set REDDIT_CLIENT_ID. "
-        "See README.md -> 'What works anonymously'."
-    )
-
-
-def _send(method: str, url: str, **kwargs):
-    """
-    Perform one HTTP request at the throttled rate, retrying once on 429.
-
-    Reddit answers 429 (Too Many Requests) when the per-client budget is
-    exhausted; the response may carry ``Retry-After`` in seconds. One retry
-    covers the common burst case without hiding a real block. A 403 is raised
-    as :class:`RedditApiError` with an explanation, because for anonymous
-    clients it is about the endpoint, not about how often you ask.
-
-    Raises:
-        RedditApiError: on 403 (endpoint not available anonymously).
-        curl_cffi.requests.errors.HTTPError: on any other non-2xx status.
-    """
-    for attempt in (1, 2):
-        _throttle()
-        resp = requests.request(method, url, **kwargs)
-        if resp.status_code == 429 and attempt == 1:
-            header = resp.headers.get("retry-after")
-            try:
-                wait = float(header) if header else DEFAULT_RETRY_AFTER
-            except (TypeError, ValueError):
-                wait = DEFAULT_RETRY_AFTER
-            time.sleep(max(0.0, min(wait, MAX_RETRY_AFTER)))
-            continue
-        if resp.status_code == 403:
-            raise RedditApiError(_forbidden_hint(url))
-        resp.raise_for_status()
-        return resp
-
-    # Not reachable: the second attempt either returns above or raises a
-    # 429-carrying HTTPError from raise_for_status().
-    raise AssertionError("unreachable")
+class RedditApiError(RuntimeError):
+    """Reddit answered with something other than a listing."""
 
 
 # ---------------------------------------------------------------------------
@@ -200,6 +145,102 @@ class Page:
 
 
 # ---------------------------------------------------------------------------
+# HTTP transport — standard library only
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _Response:
+    """Minimal response wrapper so callers see one uniform shape."""
+
+    status_code: int
+    headers: Any                  # email.message.Message; supports .get()
+    body: bytes
+
+    def json(self) -> Any:
+        return json.loads(self.body.decode("utf-8"))
+
+
+def _throttle() -> None:
+    """Block until at least MIN_REQUEST_INTERVAL has passed since the last call."""
+    global _last_request_at
+    with _throttle_lock:
+        wait = MIN_REQUEST_INTERVAL - (time.monotonic() - _last_request_at)
+        if wait > 0:
+            time.sleep(wait)
+        _last_request_at = time.monotonic()
+
+
+def _retry_after_seconds(headers: Any) -> float:
+    """Read Retry-After from a response, clamped to a sane maximum."""
+    try:
+        value = float(headers.get("retry-after"))
+    except (TypeError, ValueError):
+        value = DEFAULT_RETRY_AFTER
+    return max(0.0, min(value, MAX_RETRY_AFTER))
+
+
+def _forbidden_hint(url: str) -> str:
+    """Explain a 403 in terms of what actually works anonymously."""
+    return (
+        f"Reddit refused this request (403): {url}\n"
+        "With anonymous app-only access the cached listings work — hot, top, "
+        "controversial, and /r/popular — while 'new', 'rising' and /r/all are "
+        "refused. Use one of the working sorts, or register your own app at "
+        "https://www.reddit.com/prefs/apps and set REDDIT_CLIENT_ID. "
+        "See README.md -> 'What works anonymously'."
+    )
+
+
+def _send(
+    url: str,
+    headers: dict[str, str],
+    params: Optional[dict[str, Any]] = None,
+    form: Optional[dict[str, Any]] = None,
+    method: str = "GET",
+) -> _Response:
+    """
+    Perform one HTTP request at the throttled rate, retrying once on 429.
+
+    Reddit answers 429 (Too Many Requests) when the per-client budget is
+    exhausted; the response may carry ``Retry-After`` in seconds. One retry
+    covers the common burst case without hiding a real block. A 403 is raised
+    as :class:`RedditApiError` with an explanation, because for anonymous
+    clients it is about the endpoint, not about how often you ask.
+
+    Raises:
+        RedditApiError: on 403 (endpoint not available anonymously), or when
+            the host cannot be reached.
+    """
+    if params:
+        url = f"{url}?{urllib.parse.urlencode(params)}"
+    data = urllib.parse.urlencode(form).encode() if form else None
+
+    for attempt in (1, 2):
+        _throttle()
+        request = urllib.request.Request(url, data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as response:
+                return _Response(int(response.status), response.headers, response.read())
+        except urllib.error.HTTPError as err:
+            status = int(err.code)
+            if status == 429 and attempt == 1:
+                time.sleep(_retry_after_seconds(err.headers))
+                err.close()
+                continue
+            if status == 403:
+                err.close()
+                raise RedditApiError(_forbidden_hint(url)) from err
+            err.close()
+            raise
+        except urllib.error.URLError as err:
+            raise RedditApiError(f"Could not reach {url}: {err.reason}") from err
+
+    # Not reachable: the second attempt either returns above or raises.
+    raise AssertionError("unreachable")
+
+
+# ---------------------------------------------------------------------------
 # Token handling
 # ---------------------------------------------------------------------------
 
@@ -213,10 +254,6 @@ class _TokenState:
 _token_state: _TokenState = _TokenState()
 
 
-class RedditApiError(RuntimeError):
-    """Raised when Reddit answers with something that is not a listing."""
-
-
 def _fetch_token() -> tuple[str, int]:
     """
     Request a fresh anonymous (app-only) access token.
@@ -226,24 +263,22 @@ def _fetch_token() -> tuple[str, int]:
 
     Returns:
         ``(access_token, expires_in_seconds)``
-
-    Raises:
-        curl_cffi.requests.errors.RequestsError / HTTPError: on network or
-            HTTP failure.
     """
-    resp = _send(
-        "POST",
+    basic = base64.b64encode(f"{CLIENT_ID}:".encode()).decode()
+    response = _send(
         TOKEN_URL,
-        auth=(CLIENT_ID, ""),
-        data={
+        headers={
+            "User-Agent": USER_AGENT,
+            "Authorization": f"Basic {basic}",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+        form={
             "grant_type": "https://oauth.reddit.com/grants/installed_client",
             "device_id": "DO_NOT_TRACK_THIS_DEVICE",
         },
-        headers={"User-Agent": USER_AGENT},
-        impersonate=TLS_IMPERSONATE,
-        timeout=30,
+        method="POST",
     )
-    payload = resp.json()
+    payload = response.json()
     return payload["access_token"], int(payload.get("expires_in", 86400))
 
 
@@ -283,13 +318,12 @@ def get_listing(
     Fetch one page of a public listing.
 
     Args:
-        subreddit: Subreddit name without ``r/``, or ``"popular"`` / ``"all"``
-            for the aggregated front-page feeds.
-        sort: ``"hot"`` (default when omitted), ``"new"``, ``"top"``,
-            ``"rising"`` or ``"controversial"``.
-            Anonymous app-only access serves ``hot``, ``top`` and
-            ``controversial``; ``new`` and ``rising`` come back as 403 (see
-            ``README.md -> "What works anonymously"``).
+        subreddit: Subreddit name without ``r/``, or ``"popular"`` for the
+            aggregated feed (``"all"`` is refused anonymously).
+        sort: ``"hot"`` (default when omitted), ``"top"`` or
+            ``"controversial"`` — and ``"new"`` / ``"rising"``, which come
+            back as 403 anonymously. See ``README.md -> "What works
+            anonymously"``.
         limit: Posts per page, 1–100. Reddit clamps anything higher.
         after: Cursor for the *next* page — take ``Page.after`` from the
             previous page.
@@ -301,8 +335,8 @@ def get_listing(
         A :class:`Page` of typed posts with the next/previous cursors.
 
     Raises:
-        RedditApiError: Reddit answered with HTML or a non-listing payload.
-        HTTPError: Reddit answered with a 4xx/5xx status.
+        RedditApiError: Reddit refused the endpoint (403), or answered with
+            HTML or a non-listing payload.
 
     Example:
         >>> page = get_listing("python", sort="top", timeframe="week", limit=10)
@@ -312,7 +346,7 @@ def get_listing(
     if sort:
         path += f"/{sort}"
 
-    params: dict[str, object] = {"limit": max(1, min(limit, 100)), "raw_json": 1}
+    params: dict[str, Any] = {"limit": max(1, min(limit, 100)), "raw_json": 1}
     if after:
         params["after"] = after
     if before:
@@ -320,15 +354,8 @@ def get_listing(
     if timeframe:
         params["t"] = timeframe
 
-    resp = _send(
-        "GET",
-        f"{OAUTH_BASE}{path}",
-        headers=_make_headers(),
-        params=params,
-        impersonate=TLS_IMPERSONATE,
-        timeout=30,
-    )
-    return parse_listing(_decode_json(resp))
+    response = _send(f"{OAUTH_BASE}{path}", headers=_make_headers(), params=params)
+    return parse_listing(_decode_json(response))
 
 
 def get_popular_posts(
@@ -340,27 +367,26 @@ def get_popular_posts(
     return get_listing("popular", limit=limit, after=after, before=before)
 
 
-def _decode_json(resp) -> dict:
+def _decode_json(response: _Response) -> Any:
     """
     Decode a response as JSON, with a clear error when Reddit served HTML.
 
     Reddit answers the web app HTML with status 200 when it does not like the
-    request (missing ``Accept`` header, wrong TLS fingerprint, login wall), so
-    a parse failure here is a real diagnostic, not a bug.
+    request (missing ``Accept`` header, login wall), so a parse failure here is
+    a real diagnostic, not a bug.
     """
     try:
-        return resp.json()
-    except Exception as exc:  # noqa: BLE001 - re-raised with context
-        ctype = resp.headers.get("content-type", "unknown")
+        return response.json()
+    except json.JSONDecodeError as exc:
+        ctype = response.headers.get("content-type", "unknown")
         raise RedditApiError(
             "Reddit did not return JSON "
-            f"(status {resp.status_code}, content-type {ctype!r}). "
-            "Check that curl_cffi is used with impersonate=TLS_IMPERSONATE "
-            "and that the request sends 'Accept: application/json'."
+            f"(status {response.status_code}, content-type {ctype!r}). "
+            "Check that the request sends 'Accept: application/json'."
         ) from exc
 
 
-def parse_listing(raw: dict) -> Page:
+def parse_listing(raw: Any) -> Page:
     """
     Convert a raw listing payload into a typed :class:`Page`.
 
