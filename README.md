@@ -47,6 +47,32 @@ python api_client.py          # demo: prints two pages of r/popular
 python example_usage.py       # writes posts.json next to the script
 ```
 
+## What works anonymously
+
+Measured against the live API, repeatedly, from a plain Windows host — the
+anonymous app-only token does **not** unlock every listing. What Reddit serves
+without an authenticated user:
+
+| Request | Result |
+|---|---|
+| `/r/popular` (no sort) | ✅ works |
+| `/r/<sub>/hot` | ✅ works |
+| `/r/<sub>/top` (± `timeframe`) | ✅ works |
+| `/r/<sub>/controversial` | ✅ works |
+| `/r/<sub>/new` | ⛔ 403 |
+| `/r/<sub>/rising` | ⛔ 403 |
+| `/r/all/...` (any sort) | ⛔ 403 |
+
+The pattern fits cached listings passing while feeds Reddit has to compute per
+request (new, rising, the /r/all aggregate) hit its bot wall. Pacing does not
+change it — the same paths still 403 at 10-second intervals, while hot/top keep
+working.
+
+Two honest workarounds: use `hot`/`top`, or register your own OAuth app at
+<https://www.reddit.com/prefs/apps> and set `REDDIT_CLIENT_ID` (a real
+authenticated client is not subject to this). A 403 from this client raises a
+`RedditApiError` that says exactly this, rather than a bare status code.
+
 ## API reference
 
 ### `get_listing(subreddit="popular", sort=None, limit=25, after=None, before=None, timeframe=None) -> Page`
@@ -55,8 +81,8 @@ One page of a listing.
 
 | Argument | Meaning |
 |---|---|
-| `subreddit` | Subreddit name without `r/`, or `"popular"` / `"all"` for the aggregated feeds. |
-| `sort` | `"hot"` (default when omitted), `"new"`, `"top"`, `"rising"`, `"controversial"`. |
+| `subreddit` | Subreddit name without `r/`, or `"popular"` for the aggregated feed (`"all"` is refused anonymously). |
+| `sort` | `"hot"` (default when omitted), `"top"`, `"controversial"` — and `"new"` / `"rising"`, which are refused anonymously (see above). |
 | `limit` | Posts per page, 1–100. Higher values are clamped. |
 | `after` / `before` | Cursor tokens — take them from a previous `Page`. |
 | `timeframe` | For `top`/`controversial`: `hour`, `day`, `week`, `month`, `year`, `all`. |
@@ -160,10 +186,11 @@ python -m unittest discover -s tests -v
 
 ## Errors and limits
 
-- `RedditApiError` — Reddit returned HTML or a payload that is not a listing.
-- `curl_cffi.requests.errors.HTTPError` — non-2xx status; check
-  `resp.status_code` (401 = token problem, 403 = fingerprint/headers, 429 =
-  rate limit).
+- `RedditApiError` — Reddit returned HTML instead of JSON, a payload that is
+  not a listing, or a **403** (endpoint not available anonymously; the message
+  names the workaround).
+- `curl_cffi.requests.errors.HTTPError` — any other non-2xx status; check
+  `resp.status_code` (401 = token problem, 429 = rate limit).
 - Rate limits: **10 requests per second** is Reddit's ceiling (its documented
   OAuth budget is around 100 requests/minute per client). This client enforces
   a 0.1 s minimum gap on every request, so a plain loop cannot trip the limit;

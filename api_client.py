@@ -109,17 +109,31 @@ def _throttle() -> None:
         _last_request_at = time.monotonic()
 
 
+def _forbidden_hint(url: str) -> str:
+    """Explain a 403 in terms of what actually works anonymously."""
+    return (
+        f"Reddit refused this request (403): {url}\n"
+        "With anonymous app-only access the cached listings work — hot, top, "
+        "controversial, and /r/popular — while 'new', 'rising' and /r/all are "
+        "refused. Use one of the working sorts, or register your own app at "
+        "https://www.reddit.com/prefs/apps and set REDDIT_CLIENT_ID. "
+        "See README.md -> 'What works anonymously'."
+    )
+
+
 def _send(method: str, url: str, **kwargs):
     """
     Perform one HTTP request at the throttled rate, retrying once on 429.
 
     Reddit answers 429 (Too Many Requests) when the per-client budget is
     exhausted; the response may carry ``Retry-After`` in seconds. One retry
-    covers the common burst case without hiding a real block.
+    covers the common burst case without hiding a real block. A 403 is raised
+    as :class:`RedditApiError` with an explanation, because for anonymous
+    clients it is about the endpoint, not about how often you ask.
 
     Raises:
-        curl_cffi.requests.errors.HTTPError: on any non-2xx status that
-            survives the retry.
+        RedditApiError: on 403 (endpoint not available anonymously).
+        curl_cffi.requests.errors.HTTPError: on any other non-2xx status.
     """
     for attempt in (1, 2):
         _throttle()
@@ -132,6 +146,8 @@ def _send(method: str, url: str, **kwargs):
                 wait = DEFAULT_RETRY_AFTER
             time.sleep(max(0.0, min(wait, MAX_RETRY_AFTER)))
             continue
+        if resp.status_code == 403:
+            raise RedditApiError(_forbidden_hint(url))
         resp.raise_for_status()
         return resp
 
@@ -271,6 +287,9 @@ def get_listing(
             for the aggregated front-page feeds.
         sort: ``"hot"`` (default when omitted), ``"new"``, ``"top"``,
             ``"rising"`` or ``"controversial"``.
+            Anonymous app-only access serves ``hot``, ``top`` and
+            ``controversial``; ``new`` and ``rising`` come back as 403 (see
+            ``README.md -> "What works anonymously"``).
         limit: Posts per page, 1–100. Reddit clamps anything higher.
         after: Cursor for the *next* page — take ``Page.after`` from the
             previous page.
