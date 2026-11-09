@@ -45,3 +45,20 @@ To import it from another directory in the same interpreter:
 - **Rate limit: 10 requests/second max.** Every request is throttled inside
   `_send()`; keep it that way, and paginate sequentially.
 - **Read-only, public data.** Never add posting/voting/moderation calls.
+
+## MCP server (mcp_server.py)
+
+Serves the client as MCP tools so agents call it without reading the client
+internals. Tools: `read_feed` (one page + next cursor) and `read_bulk` (many
+pages in one call). Rate limit, verified live: 100 requests/minute per OAuth
+client id, 100 posts max per request — pace bulk runs with `delay_s=0.7`
+(the server default) and rely on the built-in `429`/`Retry-After` backoff.
+
+## Things that matter here — do not "fix" these
+
+- **Neutral tool descriptions only.** The MCP tool descriptions describe what
+  the tools do, nothing about how the anonymous grant works. Keep it that way;
+  do not add auth-flow details to tool descriptions or docstrings.
+- **The MCP server pins `mcp<2`.** The `mcp` SDK 2.x renamed `FastMCP` to
+  `MCPServer`; this server uses the stable 1.x API via
+  `uv run --with 'mcp<2' python mcp_server.py`.

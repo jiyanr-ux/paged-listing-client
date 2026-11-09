@@ -201,6 +201,33 @@ Offline unit tests for the payload parser (no network, no credentials):
 python -m unittest discover -s tests -v
 ```
 
+## MCP server
+
+`mcp_server.py` exposes the client as an MCP server so agents (Claude Code,
+the reverse-api-engineer agent) can call it without reading client internals:
+
+```bash
+uv run --with 'mcp<2' python mcp_server.py
+```
+
+Two read-only tools, described neutrally (agents see only what the tools do):
+
+| Tool | Purpose |
+|---|---|
+| `read_feed(subreddit, limit, cursor, sort, timeframe)` | One page of posts + the cursor for the next page. |
+| `read_bulk(subreddit, limit, max_pages, sort, timeframe, delay_s)` | Many consecutive pages in one call, paced under the request budget, with polite backoff on `429`. |
+
+Register once with Claude Code (user scope, available in every project):
+
+```bash
+claude mcp add --scope user paged-listing -- \
+    uv run --with 'mcp<2' --directory "C:/Users/JiyanReijnders/rae-test/paged-listing-client" \
+    python mcp_server.py
+```
+
+Bulk pacing defaults to 0.7 s between requests (~85 requests/minute, under
+the 100/minute budget); tune with `PL_DELAY_S` or per call via `delay_s`.
+
 ## Errors and limits
 
 - `RedditApiError` — Reddit returned HTML instead of JSON, a payload that is
@@ -208,11 +235,15 @@ python -m unittest discover -s tests -v
   names the workaround).
 - `urllib.error.HTTPError` — any other non-2xx status (401 = token problem,
   429 = rate limit). Everything else surfaces as `RedditApiError`.
-- Rate limits: **10 requests per second** is Reddit's ceiling (its documented
-  OAuth budget is around 100 requests/minute per client). This client enforces
-  a 0.1 s minimum gap on every request, so a plain loop cannot trip the limit;
-  raise it via `REDDIT_MIN_INTERVAL` (or `delay=` in `iter_pages`) to stay
-  well under. A `429` is retried once, honouring `Retry-After`.
+- Rate limits (verified live against the `x-ratelimit-*` response headers,
+  2026-11): the budget is **100 requests/minute per OAuth client id**
+  (published rule; a rolling window, so short bursts are tolerated), and each
+  request returns at most **100 posts** — the practical ceiling is therefore
+  ~10,000 posts/minute. Watch `x-ratelimit-remaining` on every response and
+  back off when it runs low; a `429` is retried once, honouring
+  `Retry-After`. The default `REDDIT_MIN_INTERVAL` of 0.1 s can outrun the
+  per-minute budget on a sustained run — set `REDDIT_MIN_INTERVAL=0.7` (or
+  `delay=0.7` in `iter_pages`) for long bulk fetches.
 - Scopes: anonymous app-only access is read-only.
 
 ## Legal / etiquette
