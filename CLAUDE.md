@@ -62,3 +62,12 @@ client id, 100 posts max per request — pace bulk runs with `delay_s=0.7`
 - **The MCP server pins `mcp<2`.** The `mcp` SDK 2.x renamed `FastMCP` to
   `MCPServer`; this server uses the stable 1.x API via
   `uv run --with 'mcp<2' python mcp_server.py`.
+
+## Discovery tools (mcp_server.py)
+
+`check_subreddits(names)` validates a list of candidate community names in
+one call against `/r/<name>/about` (works anonymously, unlike
+`/subreddits/search`, which 403s). The skill workflow is: brainstorm
+candidates for the research topic, validate with `check_subreddits`, then
+`read_bulk` the confirmed ones. Do not add a subreddit-search tool — the
+search endpoints are anonymous-403.

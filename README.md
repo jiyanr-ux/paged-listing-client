@@ -216,6 +216,7 @@ Two read-only tools, described neutrally (agents see only what the tools do):
 |---|---|
 | `read_feed(subreddit, limit, cursor, sort, timeframe)` | One page of posts + the cursor for the next page. |
 | `read_bulk(subreddit, limit, max_pages, sort, timeframe, delay_s)` | Many consecutive pages in one call, paced under the request budget, with polite backoff on `429`. |
+| `check_subreddits(names)` | Validate candidate communities (name, title, subscriber count, description) before reading feeds. |
 
 Register once with Claude Code (user scope, available in every project):
 

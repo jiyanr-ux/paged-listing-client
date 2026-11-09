@@ -30,7 +30,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from mcp.server.fastmcp import FastMCP
 
-from api_client import iter_pages, get_listing
+from api_client import OAUTH_BASE, iter_pages, get_listing, _make_headers, _send
 
 # Measured with the service's own rate-limit response headers:
 #   - 100 requests per minute per OAuth client id (rolling window, bursts ok)
@@ -67,6 +67,39 @@ def _page_to_json(page: Any) -> dict:
         ],
         "next_cursor": page.after,
     }
+
+
+@mcp.tool()
+def check_subreddits(names: list[str]) -> str:
+    """Check candidate communities and return their public metadata.
+
+    Given a list of candidate community names, returns for each one either
+    its metadata (name, title, subscriber count, description, over-18 flag)
+    or a note that it is not publicly readable. Use this to validate a
+    candidate list before reading feeds. Read-only, anonymous access.
+    """
+    checked = []
+    for name in names[:100]:
+        try:
+            resp = _send(
+                f"{OAUTH_BASE}/r/{name}/about",
+                headers=_make_headers(),
+                params={"raw_json": 1},
+            )
+            d = resp.json().get("data", {})
+            checked.append(
+                {
+                    "subreddit": d.get("display_name", name),
+                    "available": bool(d),
+                    "title": d.get("title", ""),
+                    "subscribers": d.get("subscribers", 0),
+                    "description": (d.get("public_description") or "")[:160],
+                    "over18": d.get("over18", False),
+                }
+            )
+        except Exception as e:  # noqa: BLE001 — one bad candidate must not sink the batch
+            checked.append({"subreddit": name, "available": False, "error": str(e)[:120]})
+    return json.dumps({"checked": checked})
 
 
 @mcp.tool()
