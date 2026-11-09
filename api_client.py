@@ -63,10 +63,29 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() not in ("utf-8", "utf-16"
 # Configuration
 # ---------------------------------------------------------------------------
 
-# Public "installed app" client id — not a secret, and no redirect URI or user
-# login is attached to it. Register your own at
-# https://www.reddit.com/prefs/apps and set REDDIT_CLIENT_ID to use it.
-CLIENT_ID: str = os.environ.get("REDDIT_CLIENT_ID", "ohXpoqrZYub1kg")
+# Credentials are configured at install time and kept out of the source:
+# set the REDDIT_CLIENT_ID environment variable, or place them in
+# ~/.paged-listing/credentials.json ({"client_id": "...", "user_agent": "..."}).
+# The installed_client grant needs only a public installed-app id — no secret,
+# no redirect URI, no user login. See https://www.reddit.com/prefs/apps.
+CREDENTIALS_PATH: str = os.path.expanduser(
+    os.environ.get("REDDIT_CREDENTIALS", "~/.paged-listing/credentials.json")
+)
+
+
+def _credential(key: str) -> str:
+    """Read one credential: environment variable first, then the local
+    credentials file. Empty when not configured."""
+    env = os.environ.get(key, "")
+    if env:
+        return env
+    file_key = {"REDDIT_CLIENT_ID": "client_id",
+                "REDDIT_USER_AGENT": "user_agent"}.get(key, key)
+    try:
+        with open(CREDENTIALS_PATH, encoding="utf-8") as fh:
+            return json.load(fh).get(file_key, "")
+    except (OSError, ValueError):
+        return ""
 
 # Reddit's API rules ask for a User-Agent that identifies the client. Set
 # REDDIT_USER_AGENT to your own before heavy use.
@@ -264,7 +283,14 @@ def _fetch_token() -> tuple[str, int]:
     Returns:
         ``(access_token, expires_in_seconds)``
     """
-    basic = base64.b64encode(f"{CLIENT_ID}:".encode()).decode()
+    client_id = _credential("REDDIT_CLIENT_ID")
+    if not client_id:
+        raise RuntimeError(
+            "No client id configured. Set REDDIT_CLIENT_ID or put "
+            '{"client_id": "..."} in ~/.paged-listing/credentials.json '
+            "(an installed-app id from reddit.com/prefs/apps)."
+        )
+    basic = base64.b64encode(f"{client_id}:".encode()).decode()
     response = _send(
         TOKEN_URL,
         headers={
